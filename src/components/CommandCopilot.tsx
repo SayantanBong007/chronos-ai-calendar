@@ -35,7 +35,9 @@ export default function CommandCopilot({
   const [input, setInput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<string>("");
   const [lastModifiedEventId, setLastModifiedEventId] = useState<string>("");
+  const latestTranscriptRef = useRef<string>("");
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "welcome",
@@ -122,39 +124,116 @@ export default function CommandCopilot({
     }
   };
 
-  const toggleVoiceAssistant = () => {
+  const toggleVoiceAssistant = async () => {
     if (isListening) {
       recognitionRef.current?.stop();
       setIsListening(false);
+      setVoiceStatus("");
       return;
     }
 
+    if (typeof window === "undefined") return;
+
+    // 1. Check HTTPS / Secure Context requirement in production
+    if (!window.isSecureContext) {
+      alert(
+        "Voice recognition requires HTTPS in production (or http://localhost). Please open your https:// deployment URL."
+      );
+      return;
+    }
+
+    // 2. Check Web Speech API support
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRecognitionAPI = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognitionAPI) {
-      alert("Please use Chrome or Edge for voice commands.");
+      alert(
+        "Voice recognition is supported in Google Chrome and Microsoft Edge. Please open this page in Chrome or Edge."
+      );
       return;
     }
 
-    const recognition = new SpeechRecognitionAPI();
-    recognition.lang = "en-US";
-    recognition.interimResults = false;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    recognition.onresult = (event: any) => {
-      const transcript = event.results?.[0]?.[0]?.transcript || "";
-      if (transcript) {
-        setInput(transcript);
-        handleSendCommand(transcript);
+    // 3. Explicitly request Microphone permission first so production browsers prompt cleanly
+    try {
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Release the raw stream immediately so SpeechRecognition can take the mic
+        stream.getTracks().forEach((track) => track.stop());
       }
-    };
-    recognition.onerror = () => setIsListening(false);
-    recognition.onend = () => setIsListening(false);
+    } catch {
+      alert(
+        "Microphone permission was blocked. Please click the Lock/Tune icon in your browser address bar, allow Microphone access, and try again."
+      );
+      return;
+    }
 
-    recognitionRef.current = recognition;
-    setIsListening(true);
-    recognition.start();
+    try {
+      const recognition = new SpeechRecognitionAPI();
+      recognition.lang = navigator.language || "en-US";
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+
+      latestTranscriptRef.current = "";
+      setVoiceStatus("Listening... speak now");
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      recognition.onresult = (event: any) => {
+        let interim = "";
+        let finalTxt = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const piece = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTxt += piece;
+          } else {
+            interim += piece;
+          }
+        }
+        const combined = (finalTxt || interim).trim();
+        if (combined) {
+          latestTranscriptRef.current = combined;
+          setInput(combined);
+        }
+        if (finalTxt.trim()) {
+          setIsListening(false);
+          setVoiceStatus("");
+          recognition.stop();
+          handleSendCommand(finalTxt.trim());
+        }
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      recognition.onerror = (event: any) => {
+        const errCode = event?.error || "unknown";
+        setIsListening(false);
+        if (errCode === "not-allowed" || errCode === "service-not-allowed") {
+          setVoiceStatus("Mic blocked — allow mic in browser address bar");
+        } else if (errCode === "no-speech") {
+          setVoiceStatus("No speech detected — tap mic and speak");
+        } else {
+          setVoiceStatus(`Voice error (${errCode}) — try Chrome/Edge`);
+        }
+        setTimeout(() => setVoiceStatus(""), 4000);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+        setVoiceStatus("");
+        // If user spoke interim words and stopped before isFinal fired, auto-submit what we captured!
+        if (latestTranscriptRef.current.trim()) {
+          const captured = latestTranscriptRef.current.trim();
+          latestTranscriptRef.current = "";
+          handleSendCommand(captured);
+        }
+      };
+
+      recognitionRef.current = recognition;
+      setIsListening(true);
+      recognition.start();
+    } catch {
+      setIsListening(false);
+      setVoiceStatus("Could not start microphone");
+    }
   };
 
   return (
@@ -233,7 +312,12 @@ export default function CommandCopilot({
       </div>
 
       {/* Input Box */}
-      <div className="border-t border-[#E9E9E7] bg-white p-3">
+      <div className="border-t border-[#E9E9E7] bg-white p-3 space-y-1.5">
+        {voiceStatus && (
+          <div className="flex items-center justify-between rounded bg-[#F3F0F8] px-2.5 py-1 text-[11px] font-medium text-[#6940A5]">
+            <span>🎙️ {voiceStatus}</span>
+          </div>
+        )}
         <div className="flex items-center gap-1.5 rounded-lg border border-[#E9E9E7] bg-[#FBFBFA] px-2 py-1.5 focus-within:border-[#37352F] focus-within:bg-white transition">
           <button
             type="button"
