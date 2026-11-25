@@ -47,98 +47,11 @@ const MONTHS: Record<string, number> = {
   december: 11,
 };
 
-/**
- * Resolves a target date from natural language:
- * - Explicit calendar dates ("27th nov", "nov 27", "26 november")
- * - Relative dates ("tomorrow", "today", "day after tomorrow")
- * - Weekdays ("monday", "friday")
- * while ignoring negated phrases like "not today" or "instead of wednesday".
- */
-export function parseTargetDate(
-  text: string,
-  currentTimeIso: string,
-  currentEvents: GCalEvent[]
-): Date {
-  // Strip negated date phrases first
-  const lower = text
-    .toLowerCase()
-    .replace(
-      /\b(?:not|instead of|rather than)\s+(?:on\s+)?(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/gi,
-      ""
-    );
-  const now = new Date(currentTimeIso);
-
-  // 1. Check explicit day + month ("27th nov", "27 november", "nov 27th")
-  const dmRegex =
-    /\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
-  const mdRegex =
-    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i;
-
-  const dmMatch = lower.match(dmRegex);
-  if (dmMatch) {
-    const dayNum = parseInt(dmMatch[1], 10);
-    const monthIdx = MONTHS[dmMatch[2].toLowerCase()];
-    if (monthIdx !== undefined && dayNum >= 1 && dayNum <= 31) {
-      const explicit = new Date(now);
-      explicit.setMonth(monthIdx, dayNum);
-      return explicit;
-    }
-  }
-
-  const mdMatch = lower.match(mdRegex);
-  if (mdMatch) {
-    const monthIdx = MONTHS[mdMatch[1].toLowerCase()];
-    const dayNum = parseInt(mdMatch[2], 10);
-    if (monthIdx !== undefined && dayNum >= 1 && dayNum <= 31) {
-      const explicit = new Date(now);
-      explicit.setMonth(monthIdx, dayNum);
-      return explicit;
-    }
-  }
-
-  // Determine the Monday of the week currently being viewed
-  let weekMonday = new Date(now);
-  if (currentEvents.length > 0 && currentEvents[0].start?.dateTime) {
-    const firstEvDate = new Date(currentEvents[0].start.dateTime);
-    const d = firstEvDate.getDay();
-    const diff = firstEvDate.getDate() - d + (d === 0 ? -6 : 1);
-    weekMonday = new Date(firstEvDate);
-    weekMonday.setDate(diff);
-    weekMonday.setHours(0, 0, 0, 0);
-  } else {
-    const d = weekMonday.getDay();
-    const diff = weekMonday.getDate() - d + (d === 0 ? -6 : 1);
-    weekMonday.setDate(diff);
-    weekMonday.setHours(0, 0, 0, 0);
-  }
-
-  if (lower.includes("day after tomorrow")) {
-    const dat = new Date(now);
-    dat.setDate(now.getDate() + 2);
-    return dat;
-  }
-
-  if (lower.includes("tomorrow")) {
-    const tom = new Date(now);
-    tom.setDate(now.getDate() + 1);
-    return tom;
-  }
-
-  if (lower.includes("today")) {
-    return new Date(now);
-  }
-
-  for (const [dayName, dayIndex] of Object.entries(WEEKDAYS)) {
-    const regex = new RegExp(`\\b${dayName}\\b`, "i");
-    if (regex.test(lower)) {
-      const target = new Date(weekMonday);
-      const offset = dayIndex === 0 ? 6 : dayIndex - 1;
-      target.setDate(weekMonday.getDate() + offset);
-      return target;
-    }
-  }
-
-  return new Date(now);
+export interface LocalDateParts {
+  year: number;
+  month: number; // 1-12
+  day: number; // 1-31
+  dayOfWeek: number; // 0 (Sun) - 6 (Sat)
 }
 
 /**
@@ -151,15 +64,194 @@ export function normalizeMeridiem(input: string): string {
 }
 
 /**
- * Parses time range like "from 10 to 11 pm", "10:00 p.m. to 11:00 p.m.", "11 to 1 pm", "11pm to 12am", or single time "at 3 pm"
+ * Extracts the user's true local wall-clock year, month, day, hour, minute in their browser's timeZone
+ * even when running on a UTC serverless node (like Vercel)!
  */
-export function parseTimeRange(
+export function getWallClockInTimeZone(
+  isoString: string,
+  timeZone: string = "Asia/Kolkata"
+): { year: number; month: number; day: number; hour: number; minute: number; dayOfWeek: number } {
+  try {
+    const dt = new Date(isoString);
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+      weekday: "short",
+      hour12: false,
+    });
+    const parts = fmt.formatToParts(dt);
+    const map: Record<string, string> = {};
+    for (const p of parts) {
+      map[p.type] = p.value;
+    }
+    const wkMap: Record<string, number> = {
+      Sun: 0,
+      Mon: 1,
+      Tue: 2,
+      Wed: 3,
+      Thu: 4,
+      Fri: 5,
+      Sat: 6,
+    };
+    const hr = parseInt(map.hour || "0", 10);
+    return {
+      year: parseInt(map.year, 10),
+      month: parseInt(map.month, 10),
+      day: parseInt(map.day, 10),
+      hour: hr === 24 ? 0 : hr,
+      minute: parseInt(map.minute || "0", 10),
+      dayOfWeek: wkMap[map.weekday] ?? dt.getDay(),
+    };
+  } catch {
+    const d = new Date(isoString);
+    return {
+      year: d.getFullYear(),
+      month: d.getMonth() + 1,
+      day: d.getDate(),
+      hour: d.getHours(),
+      minute: d.getMinutes(),
+      dayOfWeek: d.getDay(),
+    };
+  }
+}
+
+/**
+ * Converts a user's local wall-clock date & time (year, month 1-12, day, hour 0-23, minute)
+ * in `timeZone` (e.g. "Asia/Kolkata") into an exact UTC ISO string so Vercel (UTC) and
+ * the user's browser ALWAYS show the exact same wall-clock time!
+ */
+export function wallClockToIso(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  timeZone: string = "Asia/Kolkata"
+): string {
+  // Handle hour >= 24 rollover (e.g. 24:00 midnight end of day)
+  const baseUtc = new Date(Date.UTC(year, month - 1, day, 0, 0, 0) + (hour * 60 + minute) * 60000);
+
+  try {
+    // Compute the offset between UTC and target timeZone at this timestamp
+    const utcDate = new Date(baseUtc.toLocaleString("en-US", { timeZone: "UTC" }));
+    const tzDate = new Date(baseUtc.toLocaleString("en-US", { timeZone }));
+    const offsetMs = tzDate.getTime() - utcDate.getTime();
+    return new Date(baseUtc.getTime() - offsetMs).toISOString();
+  } catch {
+    // Fallback for Asia/Kolkata (+05:30 = 330 mins)
+    return new Date(baseUtc.getTime() - 330 * 60000).toISOString();
+  }
+}
+
+/**
+ * Adds `daysToAdd` to a { year, month, day } tuple cleanly
+ */
+function addDaysToParts(parts: LocalDateParts, daysToAdd: number): LocalDateParts {
+  const d = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + daysToAdd, 12, 0, 0));
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    dayOfWeek: d.getUTCDay(),
+  };
+}
+
+/**
+ * Resolves the target { year, month, day } in the user's timeZone
+ */
+export function parseTargetDateParts(
   text: string,
-  baseDate: Date
-): { start: Date; end: Date; hasExplicitTime: boolean } {
+  currentTimeIso: string,
+  currentEvents: GCalEvent[],
+  timeZone: string = "Asia/Kolkata"
+): LocalDateParts {
+  const lower = text
+    .toLowerCase()
+    .replace(
+      /\b(?:not|instead of|rather than)\s+(?:on\s+)?(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/gi,
+      ""
+    );
+
+  const nowWall = getWallClockInTimeZone(currentTimeIso, timeZone);
+  const todayParts: LocalDateParts = {
+    year: nowWall.year,
+    month: nowWall.month,
+    day: nowWall.day,
+    dayOfWeek: nowWall.dayOfWeek,
+  };
+
+  // 1. Explicit date ("27th nov", "nov 27")
+  const dmRegex =
+    /\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
+  const mdRegex =
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i;
+
+  const dmMatch = lower.match(dmRegex);
+  if (dmMatch) {
+    const dayNum = parseInt(dmMatch[1], 10);
+    const monthIdx = MONTHS[dmMatch[2].toLowerCase()];
+    if (monthIdx !== undefined && dayNum >= 1 && dayNum <= 31) {
+      return addDaysToParts({ year: todayParts.year, month: monthIdx + 1, day: dayNum, dayOfWeek: 0 }, 0);
+    }
+  }
+
+  const mdMatch = lower.match(mdRegex);
+  if (mdMatch) {
+    const monthIdx = MONTHS[mdMatch[1].toLowerCase()];
+    const dayNum = parseInt(mdMatch[2], 10);
+    if (monthIdx !== undefined && dayNum >= 1 && dayNum <= 31) {
+      return addDaysToParts({ year: todayParts.year, month: monthIdx + 1, day: dayNum, dayOfWeek: 0 }, 0);
+    }
+  }
+
+  // Determine the Monday of the active calendar week in user's timeZone
+  let refForMonday = todayParts;
+  if (currentEvents.length > 0 && currentEvents[0].start?.dateTime) {
+    const firstWall = getWallClockInTimeZone(currentEvents[0].start.dateTime, timeZone);
+    refForMonday = {
+      year: firstWall.year,
+      month: firstWall.month,
+      day: firstWall.day,
+      dayOfWeek: firstWall.dayOfWeek,
+    };
+  }
+  const diffToMonday = refForMonday.dayOfWeek === 0 ? -6 : 1 - refForMonday.dayOfWeek;
+  const weekMonday = addDaysToParts(refForMonday, diffToMonday);
+
+  if (lower.includes("day after tomorrow")) {
+    return addDaysToParts(todayParts, 2);
+  }
+  if (lower.includes("tomorrow")) {
+    return addDaysToParts(todayParts, 1);
+  }
+  if (lower.includes("today")) {
+    return todayParts;
+  }
+
+  for (const [dayName, dayIndex] of Object.entries(WEEKDAYS)) {
+    const regex = new RegExp(`\\b${dayName}\\b`, "i");
+    if (regex.test(lower)) {
+      const offset = dayIndex === 0 ? 6 : dayIndex - 1;
+      return addDaysToParts(weekMonday, offset);
+    }
+  }
+
+  return todayParts;
+}
+
+/**
+ * Parses time range in the user's local timeZone and returns exact ISO strings
+ */
+export function parseTimeRangeIso(
+  text: string,
+  dateParts: LocalDateParts,
+  timeZone: string = "Asia/Kolkata"
+): { startIso: string; endIso: string; hasExplicitTime: boolean } {
   const lower = normalizeMeridiem(text).toLowerCase();
-  const start = new Date(baseDate);
-  const end = new Date(baseDate);
 
   // 1. Match range: "(from )? HH(:MM)? (am|pm)? (to|-) HH(:MM)? (am|pm)"
   const rangeRegex =
@@ -173,10 +265,6 @@ export function parseTimeRange(
     const m2 = rangeMatch[5] ? parseInt(rangeMatch[5], 10) : 0;
     const mer2 = rangeMatch[6].toLowerCase();
 
-    // Smart meridiem inference when first time omits am/pm:
-    // e.g. "11 to 1 pm" -> rawH1 (11) > rawH2 (1) and rawH1 !== 12, so 11 is AM and 1 is PM!
-    // whereas "12 to 2 pm" -> rawH1 === 12, so 12 is PM!
-    // whereas "10 to 11 pm" -> rawH1 (10) < rawH2 (11), so both are PM!
     let mer1 = rangeMatch[3] ? rangeMatch[3].toLowerCase() : mer2;
     if (!rangeMatch[3]) {
       if (mer2 === "pm" && rawH1 > rawH2 && rawH1 !== 12) {
@@ -193,14 +281,26 @@ export function parseTimeRange(
     if (mer1 === "am" && h1 === 12) h1 = 0;
 
     if (mer2 === "pm" && h2 < 12) h2 += 12;
-    if (mer2 === "am" && h2 === 12) h2 = 24;
-
-    start.setHours(h1, m1, 0, 0);
-    end.setHours(h2, m2, 0, 0);
-    if (end.getTime() <= start.getTime()) {
-      end.setTime(start.getTime() + 60 * 60 * 1000);
+    if (mer2 === "am" && h2 === 12) {
+      // Crucial human convention fix:
+      // If start is morning AM (e.g. "10 to 12 am" or "9am to 12am"), people almost always mean 10:00 AM to 12:00 PM (Noon, 12), NOT a 14-hour meeting until midnight!
+      // Whereas if start is night PM (e.g. "11pm to 12am" or "10 to 12am" at night), 12am means midnight (24).
+      if (mer1 === "am" && h1 >= 6 && h1 <= 11) {
+        h2 = 12; // 12:00 PM Noon
+      } else {
+        h2 = 24; // 12:00 AM Midnight
+      }
     }
-    return { start, end, hasExplicitTime: true };
+
+    if (h2 < h1 || (h2 === h1 && m2 <= m1)) {
+      h2 = h1 + 1;
+    }
+
+    return {
+      startIso: wallClockToIso(dateParts.year, dateParts.month, dateParts.day, h1, m1, timeZone),
+      endIso: wallClockToIso(dateParts.year, dateParts.month, dateParts.day, h2, m2, timeZone),
+      hasExplicitTime: true,
+    };
   }
 
   // 2. Match single time: "at 3 pm" or "10:30 am"
@@ -216,34 +316,35 @@ export function parseTimeRange(
     const durMatch = lower.match(/(\d+)\s*(?:min|mins|minute|minutes)/i);
     const durationMin = durMatch ? parseInt(durMatch[1], 10) : 60;
 
-    start.setHours(h1, m1, 0, 0);
-    end.setTime(start.getTime() + durationMin * 60 * 1000);
-    return { start, end, hasExplicitTime: true };
+    const sIso = wallClockToIso(dateParts.year, dateParts.month, dateParts.day, h1, m1, timeZone);
+    const eIso = new Date(new Date(sIso).getTime() + durationMin * 60000).toISOString();
+
+    return { startIso: sIso, endIso: eIso, hasExplicitTime: true };
   }
 
+  // 3. Morning / Afternoon / Evening defaults
+  let defH1 = 11;
+  let defH2 = 12;
   if (lower.includes("morning")) {
-    start.setHours(10, 0, 0, 0);
-    end.setHours(11, 0, 0, 0);
-    return { start, end, hasExplicitTime: false };
-  }
-  if (lower.includes("evening") || lower.includes("night")) {
-    start.setHours(19, 0, 0, 0);
-    end.setHours(20, 0, 0, 0);
-    return { start, end, hasExplicitTime: false };
-  }
-  if (lower.includes("afternoon")) {
-    start.setHours(14, 0, 0, 0);
-    end.setHours(15, 0, 0, 0);
-    return { start, end, hasExplicitTime: false };
+    defH1 = 10;
+    defH2 = 11;
+  } else if (lower.includes("evening") || lower.includes("night")) {
+    defH1 = 19;
+    defH2 = 20;
+  } else if (lower.includes("afternoon")) {
+    defH1 = 14;
+    defH2 = 15;
   }
 
-  start.setHours(11, 0, 0, 0);
-  end.setHours(12, 0, 0, 0);
-  return { start, end, hasExplicitTime: false };
+  return {
+    startIso: wallClockToIso(dateParts.year, dateParts.month, dateParts.day, defH1, 0, timeZone),
+    endIso: wallClockToIso(dateParts.year, dateParts.month, dateParts.day, defH2, 0, timeZone),
+    hasExplicitTime: false,
+  };
 }
 
 /**
- * Extracts a clean event title from conversational prompts
+ * Extracts a clean event title from conversational prompts (including common typos like "ceate a mitiing")
  */
 export function extractCleanEventTitle(prompt: string): string {
   let text = normalizeMeridiem(prompt).trim();
@@ -258,7 +359,6 @@ export function extractCleanEventTitle(prompt: string): string {
     return "Candidate Interview";
   }
 
-  // Iteratively strip leading conversational fillers ("hello", "can you", "please", "ok", etc.)
   for (let i = 0; i < 4; i++) {
     text = text.replace(
       /^(ok|okay|hey|hi|hello|please|can you|could you|would you|will you|i want to|i need to|i have to|let's|lets)[,\s]+/i,
@@ -266,9 +366,10 @@ export function extractCleanEventTitle(prompt: string): string {
     );
   }
 
+  // Tolerate common typos in verbs ("ceate", "craete", "scedule", "ad") and nouns ("mitiing", "meting", "meating", "cal")
   text = text
     .replace(
-      /^(add|book|schedule|create|set up|setup|put|arrange|organize)\s+(one\s+|an\s+|a\s+)?(new\s+)?(event|meeting|call|appointment|slot|sync|session)?\s*(on\s+|for\s+|about\s+|of\s+)?/i,
+      /^(add|ad|book|schedule|scedule|create|ceate|craete|creat|make|set up|setup|put|arrange|organize)\s+(one\s+|an\s+|a\s+)?(new\s+)?(event|meeting|mitiing|meting|meating|meet|call|cal|appointment|slot|sync|session)?\s*(on\s+|for\s+|about\s+|of\s+)?/i,
       ""
     )
     .replace(/\b(i have to|i need to|i want to|to)\s+(take|attend|do|have)\s+(an\s+|a\s+)?/gi, "")
@@ -292,6 +393,7 @@ export function extractCleanEventTitle(prompt: string): string {
     .replace(/\b(morning|afternoon|evening|night)\b/gi, "")
     .replace(/\b(30-min|45-min|60-min|1-hour|30 mins|45 mins|1 hour)\b/gi, "")
     .replace(/^\s*(of|for|about|on)\s+/i, "Meeting of ")
+    .replace(/^(meeting|mitiing|meting|meating|event|call)$/i, "")
     .replace(/[.,!?]+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -304,18 +406,47 @@ export function extractCleanEventTitle(prompt: string): string {
 }
 
 /**
+ * Formats an ISO timestamp range nicely in the user's timeZone (so Vercel UTC server prints IST times!)
+ */
+export function formatRangeInTimeZone(
+  startIso: string,
+  endIso: string,
+  timeZone: string = "Asia/Kolkata"
+): string {
+  const s = new Date(startIso);
+  const e = new Date(endIso);
+  const dateStr = s.toLocaleDateString("en-US", {
+    timeZone,
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+  const sTime = s.toLocaleTimeString("en-US", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const eTime = e.toLocaleTimeString("en-US", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `${dateStr}, ${sTime} – ${eTime}`;
+}
+
+/**
  * Finds the exact event in `currentEvents` matching a delete/move prompt
- * by checking contextual pronouns ("delete it", "remove that"), weekday, time, and title keywords.
+ * using timezone-aware weekday and hour matching!
  */
 export function findBestMatchingEvent(
   prompt: string,
   currentEvents: GCalEvent[],
-  lastModifiedEventId?: string
+  lastModifiedEventId?: string,
+  timeZone: string = "Asia/Kolkata"
 ): GCalEvent | null {
   if (currentEvents.length === 0) return null;
   const lower = normalizeMeridiem(prompt).toLowerCase().trim();
 
-  // If user says "delete it", "remove that", "cancel it", "delete last one"
   if (
     /\b(it|that|this|last one|previous one)\b/i.test(lower) &&
     lastModifiedEventId
@@ -358,20 +489,22 @@ export function findBestMatchingEvent(
 
   for (const ev of currentEvents) {
     let score = 0;
-    const evStart = ev.start.dateTime ? new Date(ev.start.dateTime) : null;
+    const evWall = ev.start.dateTime
+      ? getWallClockInTimeZone(ev.start.dateTime, timeZone)
+      : null;
 
-    if (targetDayOfWeek !== null && evStart) {
-      if (evStart.getDay() === targetDayOfWeek) {
+    if (targetDayOfWeek !== null && evWall) {
+      if (evWall.dayOfWeek === targetDayOfWeek) {
         score += 50;
       } else {
         score -= 20;
       }
     }
 
-    if (targetHour !== null && evStart) {
-      if (evStart.getHours() === targetHour) {
+    if (targetHour !== null && evWall) {
+      if (evWall.hour === targetHour) {
         score += 60;
-      } else if (Math.abs(evStart.getHours() - targetHour) <= 1) {
+      } else if (Math.abs(evWall.hour - targetHour) <= 1) {
         score += 20;
       }
     }

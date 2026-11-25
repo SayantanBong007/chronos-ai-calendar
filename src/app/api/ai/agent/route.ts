@@ -12,10 +12,13 @@ import {
   findNextAvailableSlot,
 } from "@/lib/gcal";
 import {
-  parseTargetDate,
-  parseTimeRange,
+  parseTargetDateParts,
+  parseTimeRangeIso,
   extractCleanEventTitle,
   findBestMatchingEvent,
+  getWallClockInTimeZone,
+  wallClockToIso,
+  formatRangeInTimeZone,
 } from "@/lib/nl-parser";
 
 export interface CalendarMutationOp {
@@ -195,10 +198,7 @@ async function executeToolAction(params: {
       log: {
         toolName,
         args,
-        resultSummary: `Found open slot at ${new Date(slot.start).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        })}`,
+        resultSummary: `Found open slot`,
         status: "success",
       },
     };
@@ -250,15 +250,16 @@ export async function POST(req: NextRequest) {
         }));
 
         const systemInstruction = `You are Chronos AI, an autonomous AI Chief of Staff inside Google Calendar.
-Current Local Time: ${currentTimeIso} (${timeZone})
-Last Modified Event ID (if user says "make it 11pm to 12am" or "change time"): ${lastModifiedEventId || "none"}
+Current Local Time: ${currentTimeIso} (User TimeZone: ${timeZone})
+Last Modified Event ID: ${lastModifiedEventId || "none"}
 Active Week Events:
 ${JSON.stringify(compactSchedule, null, 2)}
 
 RULES:
 1. Immediately execute the tools (createCalendarEvent, moveOrUpdateCalendarEvent, deleteCalendarEvent, findOptimalFreeSlot) to fulfill the user's request.
-2. When creating events, extract a clean, concise professional title (e.g., "Candidate Interview", NOT the entire sentence).
-3. Keep your final response concise, friendly, and clear (2 sentences max).`;
+2. Always generate timestamps in the user's timezone (${timeZone}).
+3. Extract a clean, concise professional title (e.g., "Business Meeting" or "Candidate Interview", NOT the entire sentence).
+4. Keep your final response concise, friendly, and clear (2 sentences max).`;
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const contents: any[] = [{ role: "user", parts: [{ text: prompt }] }];
@@ -323,7 +324,7 @@ RULES:
       }
     }
 
-    // 2. Smart Natural Language Parser Engine (Handles dates, time ranges, follow-up time edits, and exact deletions!)
+    // 2. Timezone-Safe Smart Natural Language Parser Engine
     const lower = prompt
       .replace(/\bp\.?\s*m\.?(?=\s|$|[.,!?])/gi, "pm")
       .replace(/\ba\.?\s*m\.?(?=\s|$|[.,!?])/gi, "am")
@@ -346,7 +347,7 @@ RULES:
       });
     }
 
-    // B1. Follow-up Rename! ("rename it to X", "change title to X", "call it X")
+    // B1. Follow-up Rename!
     const renameMatch = prompt.match(
       /^(?:please\s+)?(?:actually\s+)?(?:rename|change\s+(?:the\s+)?(?:title|name)|call)\s+(?:it|that|this|the\s+event|the\s+meeting)?\s*(?:to|as)\s+(.+)$/i
     );
@@ -377,13 +378,15 @@ RULES:
       }
     }
 
-    // B2. Follow-up time or day correction! (e.g. user just created an event and says "11pm to 12am", "actually make it 2pm to 4pm", or "on friday not today")
+    // B2. Follow-up time or day correction!
     const isPureTimeCorrection =
       /^(?:actually\s+)?(?:make it|change it to|change to|no|wait|sorry|set it to|from)?\s*(?:from\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*(?:to|-|–|till|until)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*$/i.test(
         lower
       );
 
-    const hasCreateVerb = /\b(add|book|schedule|create|set up|setup|new)\b/i.test(lower);
+    const hasCreateVerb = /\b(add|ad|book|schedule|scedule|create|ceate|craete|creat|set up|setup|new)\b/i.test(
+      lower
+    );
     const hasWeekdayOrRelative =
       /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)\b/i.test(lower);
     const isFollowUpDayOrTimeCorrection =
@@ -399,35 +402,43 @@ RULES:
         currentEvents[currentEvents.length - 1];
 
       if (targetEv && targetEv.start.dateTime && targetEv.end.dateTime) {
-        const oldStart = new Date(targetEv.start.dateTime);
-        const oldEnd = new Date(targetEv.end.dateTime);
-        const durationMs = Math.max(30 * 60 * 1000, oldEnd.getTime() - oldStart.getTime());
+        const oldStartWall = getWallClockInTimeZone(targetEv.start.dateTime, timeZone);
+        const durationMs = Math.max(
+          30 * 60 * 1000,
+          new Date(targetEv.end.dateTime).getTime() - new Date(targetEv.start.dateTime).getTime()
+        );
 
-        // Resolve new date if weekday mentioned, otherwise keep existing event's date
-        const baseDate = hasWeekdayOrRelative
-          ? parseTargetDate(prompt, currentTimeIso, currentEvents)
-          : new Date(oldStart);
+        const dateParts = hasWeekdayOrRelative
+          ? parseTargetDateParts(prompt, currentTimeIso, currentEvents, timeZone)
+          : {
+              year: oldStartWall.year,
+              month: oldStartWall.month,
+              day: oldStartWall.day,
+              dayOfWeek: oldStartWall.dayOfWeek,
+            };
 
-        const { start, end, hasExplicitTime } = parseTimeRange(prompt, baseDate);
+        const { startIso, endIso, hasExplicitTime } = parseTimeRangeIso(prompt, dateParts, timeZone);
 
-        let newStart: Date;
-        let newEnd: Date;
-        if (hasExplicitTime) {
-          newStart = start;
-          newEnd = end;
-        } else {
-          // Preserve existing hours/minutes on the newly chosen day!
-          newStart = new Date(baseDate);
-          newStart.setHours(oldStart.getHours(), oldStart.getMinutes(), 0, 0);
-          newEnd = new Date(newStart.getTime() + durationMs);
+        let finalStartIso = startIso;
+        let finalEndIso = endIso;
+        if (!hasExplicitTime) {
+          finalStartIso = wallClockToIso(
+            dateParts.year,
+            dateParts.month,
+            dateParts.day,
+            oldStartWall.hour,
+            oldStartWall.minute,
+            timeZone
+          );
+          finalEndIso = new Date(new Date(finalStartIso).getTime() + durationMs).toISOString();
         }
 
         const { log, mutation } = await executeToolAction({
           toolName: "moveOrUpdateCalendarEvent",
           args: {
             eventId: targetEv.id,
-            newStartDateTime: newStart.toISOString(),
-            newEndDateTime: newEnd.toISOString(),
+            newStartDateTime: finalStartIso,
+            newEndDateTime: finalEndIso,
           },
           accessToken,
           workingEvents: currentEvents,
@@ -437,31 +448,25 @@ RULES:
         if (mutation) mutations.push(mutation);
 
         return NextResponse.json({
-          reply: `Moved **"${targetEv.summary}"** to **${newStart.toLocaleDateString("en-US", {
-            weekday: "short",
-            month: "short",
-            day: "numeric",
-          })}, ${newStart.toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-          })} – ${newEnd.toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-          })}**.`,
+          reply: `${hasWeekdayOrRelative ? "Moved" : "Updated"} **"${targetEv.summary}"** to **${formatRangeInTimeZone(
+            finalStartIso,
+            finalEndIso,
+            timeZone
+          )}**.`,
           toolLogs,
           mutations,
         });
       }
     }
 
-    // C. Delete / Cancel an event (matches by weekday + time + title!)
+    // C. Delete / Cancel an event
     if (
       lower.includes("delete") ||
       lower.includes("cancel") ||
       lower.includes("remove") ||
       lower.includes("not deleted")
     ) {
-      const targetEv = findBestMatchingEvent(prompt, currentEvents, lastModifiedEventId);
+      const targetEv = findBestMatchingEvent(prompt, currentEvents, lastModifiedEventId, timeZone);
 
       if (targetEv) {
         const { log, mutation } = await executeToolAction({
@@ -476,6 +481,7 @@ RULES:
 
         const startTimeStr = targetEv.start.dateTime
           ? new Date(targetEv.start.dateTime).toLocaleString("en-US", {
+              timeZone,
               weekday: "short",
               hour: "2-digit",
               minute: "2-digit",
@@ -530,7 +536,11 @@ RULES:
         return NextResponse.json({
           reply: `Fixed! I moved **"${lowestPriority.summary}"** to the next open slot at **${new Date(
             slot.start
-          ).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}** so your high-priority call stays protected.`,
+          ).toLocaleTimeString("en-US", {
+            timeZone,
+            hour: "2-digit",
+            minute: "2-digit",
+          })}** so your high-priority call stays protected.`,
           toolLogs,
           mutations,
         });
@@ -550,20 +560,20 @@ RULES:
       lower.includes("shift") ||
       lower.includes("change")
     ) {
-      const targetEv = findBestMatchingEvent(prompt, currentEvents, lastModifiedEventId);
+      const targetEv = findBestMatchingEvent(prompt, currentEvents, lastModifiedEventId, timeZone);
       if (targetEv && targetEv.start.dateTime && targetEv.end.dateTime) {
-        const targetDate = parseTargetDate(prompt, currentTimeIso, currentEvents);
-        const { start, end, hasExplicitTime } = parseTimeRange(prompt, targetDate);
+        const dateParts = parseTargetDateParts(prompt, currentTimeIso, currentEvents, timeZone);
+        const { startIso, endIso, hasExplicitTime } = parseTimeRangeIso(prompt, dateParts, timeZone);
 
         const durationMs =
           new Date(targetEv.end.dateTime).getTime() -
           new Date(targetEv.start.dateTime).getTime();
 
         const finalSlot = hasExplicitTime
-          ? { start: start.toISOString(), end: end.toISOString() }
+          ? { start: startIso, end: endIso }
           : findNextAvailableSlot(
               currentEvents,
-              targetDate.toISOString(),
+              startIso,
               durationMs,
               targetEv.id
             );
@@ -583,15 +593,10 @@ RULES:
         if (mutation) mutations.push(mutation);
 
         return NextResponse.json({
-          reply: `Moved **"${targetEv.summary}"** to **${new Date(finalSlot.start).toLocaleString(
-            "en-US",
-            {
-              weekday: "short",
-              month: "short",
-              day: "numeric",
-              hour: "2-digit",
-              minute: "2-digit",
-            }
+          reply: `Moved **"${targetEv.summary}"** to **${formatRangeInTimeZone(
+            finalSlot.start,
+            finalSlot.end,
+            timeZone
           )}**.`,
           toolLogs,
           mutations,
@@ -606,11 +611,19 @@ RULES:
       lower.includes("coding") ||
       lower.includes("block")
     ) {
-      const targetDate = parseTargetDate(prompt, currentTimeIso, currentEvents);
-      const { start, end, hasExplicitTime } = parseTimeRange(prompt, targetDate);
+      const dateParts = parseTargetDateParts(prompt, currentTimeIso, currentEvents, timeZone);
+      const { startIso, endIso, hasExplicitTime } = parseTimeRangeIso(prompt, dateParts, timeZone);
+      const nineAmIso = wallClockToIso(
+        dateParts.year,
+        dateParts.month,
+        dateParts.day,
+        9,
+        0,
+        timeZone
+      );
       const slot = hasExplicitTime
-        ? { start: start.toISOString(), end: end.toISOString() }
-        : findNextAvailableSlot(currentEvents, targetDate.toISOString(), 2 * 3600 * 1000);
+        ? { start: startIso, end: endIso }
+        : findNextAvailableSlot(currentEvents, nineAmIso, 2 * 3600 * 1000);
 
       const { log, mutation } = await executeToolAction({
         toolName: "createCalendarEvent",
@@ -628,15 +641,10 @@ RULES:
       if (mutation) mutations.push(mutation);
 
       return NextResponse.json({
-        reply: `Protected a **Deep Work Block** on **${new Date(slot.start).toLocaleString(
-          "en-US",
-          {
-            weekday: "short",
-            month: "short",
-            day: "numeric",
-            hour: "2-digit",
-            minute: "2-digit",
-          }
+        reply: `Protected a **Deep Work Block** on **${formatRangeInTimeZone(
+          slot.start,
+          slot.end,
+          timeZone
         )}**.`,
         toolLogs,
         mutations,
@@ -649,9 +657,7 @@ RULES:
         lower.includes("what") ||
         lower.includes("show") ||
         lower.includes("list")) &&
-      !lower.includes("add") &&
-      !lower.includes("book") &&
-      !lower.includes("schedule")
+      !hasCreateVerb
     ) {
       const deepBlocks = currentEvents.filter((e) => e.aiCategory === "DEEP_WORK");
       const highRoi = currentEvents.filter((e) => e.aiCategory === "HIGH_ROI");
@@ -665,21 +671,24 @@ RULES:
       });
     }
 
-    // H. Book / Add / Create a new Event (Parses exact day of week, exact start-to-end time range, and extracts a clean title!)
+    // H. Book / Add / Create a new Event (Tolerates typos like "ceate a mitiing" and computes exact timezone-safe ISO timestamps!)
     const hasSchedulingIntent =
-      /\b(book|schedule|add|create|set up|setup|meet|meeting|call|sync|catchup|catch-up|interview|demo|review|lunch|coffee|session|event|take|have|at|from|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(
+      /\b(book|schedule|scedule|add|ad|create|ceate|craete|creat|set up|setup|meet|meeting|mitiing|meting|meating|call|cal|sync|catchup|catch-up|interview|demo|review|lunch|coffee|session|event|take|have|at|from|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(
         lower
       );
 
     if (hasSchedulingIntent) {
-      const targetDate = parseTargetDate(prompt, currentTimeIso, currentEvents);
-      const { start, end, hasExplicitTime } = parseTimeRange(prompt, targetDate);
+      const dateParts = parseTargetDateParts(prompt, currentTimeIso, currentEvents, timeZone);
+      const { startIso, endIso, hasExplicitTime } = parseTimeRangeIso(prompt, dateParts, timeZone);
       const summary = extractCleanEventTitle(prompt);
 
-      const durationMs = Math.max(30 * 60 * 1000, end.getTime() - start.getTime());
+      const durationMs = Math.max(
+        30 * 60 * 1000,
+        new Date(endIso).getTime() - new Date(startIso).getTime()
+      );
       const finalSlot = hasExplicitTime
-        ? { start: start.toISOString(), end: end.toISOString() }
-        : findNextAvailableSlot(currentEvents, start.toISOString(), durationMs);
+        ? { start: startIso, end: endIso }
+        : findNextAvailableSlot(currentEvents, startIso, durationMs);
 
       const { log, mutation } = await executeToolAction({
         toolName: "createCalendarEvent",
@@ -696,21 +705,12 @@ RULES:
       toolLogs.push(log);
       if (mutation) mutations.push(mutation);
 
-      const sDt = new Date(finalSlot.start);
-      const eDt = new Date(finalSlot.end);
-
       return NextResponse.json({
-        reply: `Scheduled **"${summary}"** for **${sDt.toLocaleDateString("en-US", {
-          weekday: "short",
-          month: "short",
-          day: "numeric",
-        })}, ${sDt.toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        })} – ${eDt.toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        })}**.`,
+        reply: `Scheduled **"${summary}"** for **${formatRangeInTimeZone(
+          finalSlot.start,
+          finalSlot.end,
+          timeZone
+        )}**.`,
         toolLogs,
         mutations,
       });
