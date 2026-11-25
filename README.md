@@ -19,6 +19,7 @@
 ### 1. Dual-Mode Execution: Live Google Calendar OAuth 2.0 + Instant Sandbox
 - **Zero-Friction Sandbox Mode:** Loads immediately with a realistic Monday–Friday business schedule (including 2 intentional double-booking conflicts) so anyone cloning the repo can test every AI feature in 0 seconds without setting up OAuth credentials first.
 - **Live Google Calendar OAuth 2.0 Sync:** Clicking **"Connect Google Calendar"** initiates the Google Identity Services OAuth 2.0 flow (`calendar` and `calendar.events` scopes) and syncs directly with `https://www.googleapis.com/calendar/v3/calendars/primary/events`.
+  - *(Evaluator Note: Since the Google OAuth app is in public prototype mode, when the Google login screen says "Google hasn't verified this app", simply click **Advanced ➔ Go to Chronos AI (unsafe) ➔ Continue** to connect your Google Calendar).*
 - **1-Click Live Calendar Seeder:** When connected to a live Google account, clicking **"+ Seed Sample Week to GCal"** injects 8 sample business events into the user's real Google Calendar for live end-to-end testing.
 
 ### 2. Conversational & Voice AI Copilot (Multi-Turn Contextual Memory)

@@ -463,6 +463,7 @@ export default function ChronosCalendarApp() {
           ) : (
             <button
               onClick={handleGoogleSignInClick}
+              title="In the Google popup, click 'Advanced -> Go to App (unsafe)' to grant Calendar access"
               className="flex items-center gap-1.5 rounded-md bg-[#37352F] px-3 py-1 text-[11px] font-medium text-white hover:bg-[#2F2D28] transition"
             >
               Connect Google Calendar
